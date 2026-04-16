@@ -33,6 +33,7 @@ DEPS_DIR="${DEPS_DIR:-$(dirname "$(realpath "$0")")}"
 PLAYBOOK_PACKAGES=(
     aide
     fapolicyd
+    mailx
     opensc
     policycoreutils-python-utils
     python3-libselinux

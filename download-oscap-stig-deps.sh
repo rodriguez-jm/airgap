@@ -46,6 +46,7 @@ ARCH="${ARCH:-x86_64}"
 RPM_PACKAGES=(
     aide
     fapolicyd
+    mailx
     opensc
     policycoreutils-python-utils
     python3-libselinux
