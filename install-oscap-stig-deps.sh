@@ -2,31 +2,40 @@
 # ==============================================================================
 # install-oscap-stig-deps.sh
 #
-# Installs all RPM packages, Ansible collections, and optional Python wheels
-# from a bundle produced by download-oscap-stig-deps.sh onto an air-gapped
-# RHEL 8 machine.
+# Installs the RPM packages required to run playbook.yml on an air-gapped
+# RHEL 8 machine. This script consumes the bundle produced by
+# download-oscap-stig-deps.sh.
 #
-# Must be run as root on the air-gapped target VM.
+# Packages installed:
+#   - aide                        (file integrity monitoring — DISA STIG requirement)
+#   - policycoreutils-python-utils (SELinux policy management)
+#   - python3-libselinux           (Python SELinux bindings for Ansible SELinux tasks)
+#   - python3-policycoreutils      (Python SELinux policy utilities)
+#
+# Assumptions:
+#   - The air-gapped machine already has Ansible and Python 3.12 installed.
+#   - No internet access is available on this machine.
+#   - This script is run from inside the extracted oscap-stig-deps/ directory.
 #
 # Usage:
 #   sudo bash install-oscap-stig-deps.sh
 #
-# The script expects to be run from within the extracted bundle directory
-# (oscap-stig-deps/) that contains rpms/, collections/, and python-pkgs/.
-#
 # Environment variable overrides:
-#   DEPS_DIR             Path to the extracted bundle   (default: script's directory)
-#   COLLECTIONS_PATH     Ansible collections install path
-#                        (default: /usr/share/ansible/collections)
-#   INSTALL_PIP_PKGS     Set to "false" to skip pip installs (default: true)
+#   DEPS_DIR   Path to the extracted bundle directory  (default: script's directory)
 # ==============================================================================
 set -euo pipefail
 
 # ── CONFIGURATION ──────────────────────────────────────────────────────────────
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="2.0.0"
 DEPS_DIR="${DEPS_DIR:-$(dirname "$(realpath "$0")")}"
-COLLECTIONS_PATH="${COLLECTIONS_PATH:-/usr/share/ansible/collections}"
-INSTALL_PIP_PKGS="${INSTALL_PIP_PKGS:-true}"
+
+# Packages the playbook installs — used for targeted verification after install
+PLAYBOOK_PACKAGES=(
+    aide
+    policycoreutils-python-utils
+    python3-libselinux
+    python3-policycoreutils
+)
 
 # ── LOGGING ────────────────────────────────────────────────────────────────────
 LOG_FILE="${DEPS_DIR}/install.log"
@@ -39,10 +48,8 @@ die()  { printf '[%s] [ERROR] %s\n'  "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -
 preflight_checks() {
     log "=== Phase 0: Preflight checks ==="
 
-    # Must run as root
-    [[ "$(id -u)" == "0" ]] || die "This script must be run as root (use: sudo bash $0)."
+    [[ "$(id -u)" == "0" ]] || die "Must be run as root (use: sudo bash $0)."
 
-    # Must be on RHEL 8 family
     if [[ ! -f /etc/redhat-release ]]; then
         die "This script must run on a RHEL/CentOS/AlmaLinux/Rocky 8 system."
     fi
@@ -52,16 +59,17 @@ preflight_checks() {
         warn "Expected RHEL 8, detected major version ${os_ver} — proceeding with caution."
     fi
 
-    # Verify expected bundle directories exist
-    for subdir in rpms collections; do
-        [[ -d "${DEPS_DIR}/${subdir}" ]] \
-            || die "Expected directory '${DEPS_DIR}/${subdir}' not found. Is DEPS_DIR set correctly?"
-    done
+    [[ -d "${DEPS_DIR}/rpms" ]] \
+        || die "RPM directory not found: ${DEPS_DIR}/rpms — is DEPS_DIR set correctly?"
 
-    # Verify file integrity against the manifest (if present)
+    local rpm_count
+    rpm_count=$(find "${DEPS_DIR}/rpms" -name '*.rpm' | wc -l)
+    (( rpm_count > 0 )) || die "No RPM files found in ${DEPS_DIR}/rpms."
+    log "Found ${rpm_count} RPM file(s) in bundle."
+
+    # Verify file integrity against the download manifest
     if [[ -f "${DEPS_DIR}/manifest.sha256" ]]; then
-        log "Verifying file integrity..."
-        # sha256sum -c expects paths relative to where it's run, so cd first
+        log "Verifying bundle integrity..."
         pushd "${DEPS_DIR}" > /dev/null
         if sha256sum -c manifest.sha256 --quiet 2>&1 | tee -a "$LOG_FILE"; then
             log "Integrity check PASSED."
@@ -70,7 +78,7 @@ preflight_checks() {
         fi
         popd > /dev/null
     else
-        warn "manifest.sha256 not found — skipping integrity verification."
+        warn "manifest.sha256 not found — skipping integrity check."
     fi
 
     log "Preflight checks complete."
@@ -78,79 +86,59 @@ preflight_checks() {
 
 # ── PHASE 1: BUILD LOCAL DNF REPOSITORY ───────────────────────────────────────
 build_local_repo() {
-    log "=== Phase 1: Building local DNF repository metadata ==="
+    log "=== Phase 1: Building local DNF repository ==="
 
     local rpm_dir="${DEPS_DIR}/rpms"
 
-    # createrepo_c should be in the bundle; bootstrap it with rpm --nodeps
-    # before using it to generate metadata for all the other packages.
+    # createrepo_c is included in the bundle; bootstrap it with rpm --nodeps
+    # before using it to generate metadata for everything else.
     if ! command -v createrepo_c &>/dev/null; then
-        log "createrepo_c not yet installed — attempting bootstrap install..."
-        local crpkg
-        crpkg=$(find "${rpm_dir}" -name 'createrepo_c-[0-9]*.rpm' ! -name '*debuginfo*' | sort -V | tail -1)
-        if [[ -n "${crpkg}" ]]; then
-            # Install createrepo_c and its direct lib deps without requiring
-            # a full dependency graph (they are all present in the bundle)
-            local cr_libs=()
-            while IFS= read -r f; do cr_libs+=("$f"); done \
-                < <(find "${rpm_dir}" -name 'python3-createrepo_c-*.rpm' \
-                                     -o -name 'createrepo_c-libs-*.rpm' 2>/dev/null || true)
-            rpm -Uvh --nodeps "${crpkg}" "${cr_libs[@]}" 2>&1 | tee -a "$LOG_FILE" || true
+        log "Bootstrapping createrepo_c from bundle..."
+        local cr_pkgs=()
+        while IFS= read -r f; do cr_pkgs+=("$f"); done < <(
+            find "${rpm_dir}" \
+                -name 'createrepo_c-[0-9]*.rpm' \
+                -o -name 'createrepo_c-libs-*.rpm' \
+                -o -name 'python3-createrepo_c-*.rpm' \
+                2>/dev/null | sort
+        )
+        if (( ${#cr_pkgs[@]} > 0 )); then
+            rpm -Uvh --nodeps "${cr_pkgs[@]}" 2>&1 | tee -a "$LOG_FILE" || true
         else
-            warn "createrepo_c RPM not found in bundle — will fall back to rpm glob install."
+            warn "createrepo_c RPMs not found in bundle — will use fallback install method."
         fi
     fi
 
     if command -v createrepo_c &>/dev/null; then
-        log "Running createrepo_c to generate repodata..."
+        log "Generating repodata for local repository..."
         createrepo_c "${rpm_dir}" 2>&1 | tee -a "$LOG_FILE"
-        log "Local repository metadata created at: ${rpm_dir}/repodata/"
+        log "Local repo metadata ready: ${rpm_dir}/repodata/"
     else
-        warn "createrepo_c unavailable — will install RPMs via 'dnf install *.rpm' fallback."
+        warn "createrepo_c unavailable — will fall back to 'dnf install *.rpm'."
     fi
 }
 
 # ── PHASE 2: INSTALL RPMs ──────────────────────────────────────────────────────
 install_rpms() {
-    log "=== Phase 2: Installing RPMs ==="
+    log "=== Phase 2: Installing packages ==="
 
     local rpm_dir="${DEPS_DIR}/rpms"
-    local rpm_count
-    rpm_count=$(find "${rpm_dir}" -name '*.rpm' ! -name '*debuginfo*' | wc -l)
-    log "Found ${rpm_count} RPM file(s) in ${rpm_dir}."
-    (( rpm_count > 0 )) || die "No RPMs found in ${rpm_dir} — bundle may be corrupt."
 
     if [[ -d "${rpm_dir}/repodata" ]]; then
-        log "Using dnf with local repodata (preferred method)..."
-        # --disablerepo='*'         : block any network repo access
-        # --repofrompath            : point dnf at our local directory
-        # --repo=local-oscap        : only use our local repo
-        # Explicitly list packages so dnf resolves the install order correctly
+        log "Installing via dnf with local repodata (preferred)..."
+        # --disablerepo='*'    : no network repo access
+        # --repofrompath       : use our local RPM directory as the sole repo
+        # --setopt gpgcheck=0  : RPMs were integrity-checked via manifest.sha256
         dnf install \
             --disablerepo='*' \
-            --repofrompath="local-oscap,${rpm_dir}" \
-            --repo='local-oscap' \
-            --setopt=local-oscap.gpgcheck=0 \
+            --repofrompath="local-oscap-stig,${rpm_dir}" \
+            --repo='local-oscap-stig' \
+            --setopt=local-oscap-stig.gpgcheck=0 \
             -y \
-            openscap \
-            openscap-scanner \
-            openscap-utils \
-            scap-security-guide \
-            ansible-core \
-            python3 \
-            python3-pip \
-            python3-jinja2 \
-            python3-pyyaml \
-            python3-cryptography \
-            python3-paramiko \
-            python3-resolvelib \
-            python3-packaging \
-            sshpass \
-            createrepo_c \
+            "${PLAYBOOK_PACKAGES[@]}" \
             2>&1 | tee -a "$LOG_FILE"
     else
-        log "Falling back to 'dnf install *.rpm'..."
-        # dnf still handles dependency ordering when given a glob of local RPMs
+        log "Installing via dnf install on RPM files (fallback)..."
         # shellcheck disable=SC2046
         dnf install \
             --disablerepo='*' \
@@ -159,119 +147,31 @@ install_rpms() {
             2>&1 | tee -a "$LOG_FILE"
     fi
 
-    log "RPM installation complete."
+    log "Package installation complete."
 }
 
-# ── PHASE 3: INSTALL ANSIBLE COLLECTIONS ──────────────────────────────────────
-install_collections() {
-    log "=== Phase 3: Installing Ansible collections ==="
-
-    local col_dir="${DEPS_DIR}/collections"
-
-    [[ -f "${col_dir}/requirements.yml" ]] \
-        || die "'${col_dir}/requirements.yml' not found. Was download-oscap-stig-deps.sh run correctly?"
-
-    mkdir -p "${COLLECTIONS_PATH}"
-
-    # ansible-galaxy resolves tarball paths relative to requirements.yml, so we
-    # must run the command from inside the collections directory.
-    pushd "${col_dir}" > /dev/null
-    log "Installing from: ${col_dir}/requirements.yml"
-    log "Installing to  : ${COLLECTIONS_PATH}"
-
-    ansible-galaxy collection install \
-        -r requirements.yml \
-        -p "${COLLECTIONS_PATH}" \
-        --offline \
-        2>&1 | tee -a "$LOG_FILE"
-
-    popd > /dev/null
-
-    log "Collections installed."
-    ansible-galaxy collection list 2>/dev/null | tee -a "$LOG_FILE" || true
-}
-
-# ── PHASE 4: INSTALL PYTHON PACKAGES (OPTIONAL) ───────────────────────────────
-install_python_pkgs() {
-    log "=== Phase 4: Installing Python packages ==="
-
-    local pkg_dir="${DEPS_DIR}/python-pkgs"
-    local pkg_count
-    pkg_count=$(find "${pkg_dir}" \( -name '*.whl' -o -name '*.tar.gz' \) 2>/dev/null | wc -l)
-
-    if (( pkg_count == 0 )); then
-        log "No Python packages found in ${pkg_dir} — skipping."
-        return 0
-    fi
-
-    log "Installing ${pkg_count} Python package file(s)..."
-
-    # --no-index     : do not query PyPI
-    # --find-links   : look for packages in our local directory
-    # --no-deps      : all deps were pre-resolved during download
-    pip3 install \
-        --no-index \
-        --find-links="${pkg_dir}" \
-        --no-deps \
-        $(find "${pkg_dir}" -name '*.whl' -printf '%f\n' \
-            | sed -E 's/-[0-9][^-]*-[^-]*-[^-]*\.whl$//; s/-/_/g') \
-        2>&1 | tee -a "$LOG_FILE" \
-    || warn "pip install failed for some packages — review the log for details."
-}
-
-# ── PHASE 5: POST-INSTALL VERIFICATION ────────────────────────────────────────
+# ── PHASE 3: POST-INSTALL VERIFICATION ────────────────────────────────────────
 verify_installation() {
-    log "=== Phase 5: Verifying installation ==="
+    log "=== Phase 3: Verifying installation ==="
 
     local errors=0
 
-    check_cmd() {
-        local cmd="$1" label="${2:-$1}"
-        if command -v "$cmd" &>/dev/null; then
-            local ver
-            ver=$("$cmd" --version 2>&1 | head -1)
-            log "  [OK]   ${label}: ${ver}"
+    for pkg in "${PLAYBOOK_PACKAGES[@]}"; do
+        if rpm -q "$pkg" &>/dev/null; then
+            log "  [OK]   ${pkg} $(rpm -q --qf '%{VERSION}-%{RELEASE}' "$pkg")"
         else
-            warn "  [FAIL] ${label} not found after installation."
-            (( errors++ )) || true
-        fi
-    }
-
-    check_cmd oscap            "OpenSCAP (oscap)"
-    check_cmd ansible          "Ansible"
-    check_cmd ansible-playbook "ansible-playbook"
-    check_cmd python3          "Python 3"
-
-    # Check SCAP content (installed by scap-security-guide)
-    local ssg_ds="/usr/share/xml/scap/ssg/content/ssg-rhel8-ds.xml"
-    if [[ -f "${ssg_ds}" ]]; then
-        log "  [OK]   SCAP data stream: ${ssg_ds}"
-    else
-        warn "  [FAIL] ${ssg_ds} not found — scap-security-guide may not have installed."
-        (( errors++ )) || true
-    fi
-
-    # Check pre-built Ansible playbooks shipped with scap-security-guide
-    local ssg_ansible_dir="/usr/share/scap-security-guide/ansible"
-    if [[ -d "${ssg_ansible_dir}" ]]; then
-        local pb_count
-        pb_count=$(find "${ssg_ansible_dir}" -name '*.yml' | wc -l)
-        log "  [OK]   Pre-built SSG Ansible playbooks: ${pb_count} found in ${ssg_ansible_dir}"
-    else
-        warn "  [FAIL] ${ssg_ansible_dir} not found."
-        (( errors++ )) || true
-    fi
-
-    # Check Ansible collections
-    for col in "ansible.posix" "community.general"; do
-        local ns="${col%%.*}" name="${col##*.}"
-        if ansible-galaxy collection list 2>/dev/null | grep -qE "${ns}[[:space:]]+${name}"; then
-            log "  [OK]   Ansible collection: ${col}"
-        else
-            warn "  [FAIL] Ansible collection '${col}' not found after install."
+            warn "  [FAIL] ${pkg} — not installed."
             (( errors++ )) || true
         fi
     done
+
+    # Verify the aide binary is executable
+    if command -v aide &>/dev/null; then
+        log "  [OK]   aide binary: $(command -v aide)"
+    else
+        warn "  [FAIL] aide binary not found in PATH."
+        (( errors++ )) || true
+    fi
 
     log ""
     if (( errors == 0 )); then
@@ -283,46 +183,26 @@ verify_installation() {
     return "${errors}"
 }
 
-# ── PHASE 6: PRINT USAGE INSTRUCTIONS ─────────────────────────────────────────
+# ── PHASE 4: PRINT USAGE ──────────────────────────────────────────────────────
 print_usage() {
     log ""
     log "============================================================"
     log "  Installation complete — how to run the STIG playbook"
     log "============================================================"
     log ""
-    log "OPTION A — Use a pre-built playbook from scap-security-guide:"
+    log "  # Copy playbook.yml to this machine, then run:"
     log ""
-    log "  ansible-playbook -i 'localhost,' -c local \\"
-    log "    /usr/share/scap-security-guide/ansible/rhel8-playbook-stig.yml"
+    log "  # Dry-run (check mode — no changes applied):"
+    log "  ansible-playbook -i 'localhost,' -c local --check playbook.yml"
     log ""
-    log "  Other available profiles:"
-    log "    ls /usr/share/scap-security-guide/ansible/rhel8-playbook-*.yml"
+    log "  # Apply all remediations:"
+    log "  ansible-playbook -i 'localhost,' -c local playbook.yml"
     log ""
-    log "OPTION B — Generate a custom playbook with oscap (any profile):"
+    log "  # Against a remote host:"
+    log "  ansible-playbook -i '192.168.1.155,' playbook.yml"
     log ""
-    log "  # List available profiles:"
-    log "  oscap info /usr/share/xml/scap/ssg/content/ssg-rhel8-ds.xml"
-    log ""
-    log "  # Generate STIG playbook:"
-    log "  oscap xccdf generate fix \\"
-    log "    --profile xccdf_org.ssgproject.content_profile_stig \\"
-    log "    --fix-type ansible \\"
-    log "    /usr/share/xml/scap/ssg/content/ssg-rhel8-ds.xml \\"
-    log "    > /tmp/rhel8-stig-playbook.yml"
-    log ""
-    log "  # Dry-run (check mode):"
-    log "  ANSIBLE_COLLECTIONS_PATH=${COLLECTIONS_PATH} \\"
-    log "    ansible-playbook -i 'localhost,' -c local --check \\"
-    log "    /tmp/rhel8-stig-playbook.yml"
-    log ""
-    log "  # Apply:"
-    log "  ANSIBLE_COLLECTIONS_PATH=${COLLECTIONS_PATH} \\"
-    log "    ansible-playbook -i 'localhost,' -c local \\"
-    log "    /tmp/rhel8-stig-playbook.yml"
-    log ""
-    log "  Tip: set collections_paths permanently in /etc/ansible/ansible.cfg:"
-    log "    [defaults]"
-    log "    collections_paths = ${COLLECTIONS_PATH}"
+    log "  NOTE: The playbook uses only ansible.builtin.* modules."
+    log "        No Ansible collections need to be installed."
     log "============================================================"
     log ""
     log "Install log: ${LOG_FILE}"
@@ -330,29 +210,20 @@ print_usage() {
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 main() {
-    # Ensure log directory exists before first log call
     mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null || true
 
     log "============================================================"
     log "  OpenSCAP STIG Dependency Installer v${SCRIPT_VERSION}"
+    log "  Bundle: ${DEPS_DIR}"
     log "============================================================"
-    log "Bundle directory: ${DEPS_DIR}"
 
     preflight_checks
     build_local_repo
     install_rpms
-    install_collections
-
-    if [[ "${INSTALL_PIP_PKGS}" == "true" ]]; then
-        install_python_pkgs
-    else
-        log "INSTALL_PIP_PKGS=false — skipping Python package install."
-    fi
-
     verify_installation
     print_usage
 
-    log "=== Install phase complete. ==="
+    log "=== Install complete. ==="
 }
 
 main "$@"
