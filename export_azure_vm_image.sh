@@ -1,37 +1,53 @@
 #!/usr/bin/env bash
 # export_azure_vm_image.sh
 #
-# Export an Azure VM as a VHD for use in air-gapped environments.
+# Export an Azure VM or managed image as a VHD for use in air-gapped environments.
 #
-# Workflow:
-#   1. Deallocate the source VM
-#   2. Generalize the VM (sysprep / waagent deprovision)
-#   3. Capture a managed image from the VM
-#   4. Create a temporary SAS-signed export URL for the managed image OS disk
-#   5. Download the VHD to a local output directory
+# Two modes of operation:
+#
+#   VM mode (--vm-name):
+#     1. Deallocate the source VM
+#     2. Generalize the VM (sysprep / waagent deprovision)
+#     3. Capture a managed image from the VM
+#     4. Generate a SAS URL for the image OS disk
+#     5. Download the VHD to a local output directory
+#
+#   Image mode (--image-name only, no --vm-name):
+#     Skips steps 1-3; exports the existing managed image directly.
+#     1. Generate a SAS URL for the image OS disk
+#     2. Download the VHD to a local output directory
 #
 # Usage:
 #   ./export_azure_vm_image.sh [OPTIONS]
 #
 # Options:
-#   -g, --resource-group    Resource group containing the VM (required)
-#   -v, --vm-name           Name of the VM to export (required)
-#   -i, --image-name        Name for the captured managed image (required)
+#   -g, --resource-group    Resource group (required)
+#   -v, --vm-name           Name of the VM to capture (omit if using an existing image)
+#   -i, --image-name        Managed image name to export, or name to give the captured image
+#                           (required when --vm-name is set; required when exporting an image)
 #   -s, --storage-account   Storage account for staging the export (required)
 #   -c, --container         Blob container name for staging (default: vm-exports)
 #   -o, --output-dir        Local directory to download the VHD (default: ./output)
-#   -l, --location          Azure region (defaults to VM's region)
+#   -l, --location          Azure region (defaults to resource's region)
 #   -r, --retention-hours   SAS token validity in hours (default: 4)
-#   -n, --no-download       Skip downloading; only create managed image and SAS URL
+#   -n, --no-download       Skip downloading; only print the SAS URL
 #   -k, --keep-image        Keep the managed image after export (default: delete)
 #   -h, --help              Show this help message
 #
 # Prerequisites:
 #   - Azure CLI (az) installed and logged in
-#   - azcopy installed if --no-download is NOT set
-#   - The VM must be running Linux with waagent, or Windows with sysprep
+#   - azcopy installed (unless --no-download is set)
+#   - VM mode: the VM must be generalizable (Linux with waagent, Windows with sysprep)
 #
-# Example:
+# Examples:
+#   # Export an existing managed image
+#   ./export_azure_vm_image.sh \
+#       --resource-group my-rg \
+#       --image-name my-existing-image \
+#       --storage-account mystorageacct \
+#       --output-dir /mnt/usb/images
+#
+#   # Capture a VM and export it
 #   ./export_azure_vm_image.sh \
 #       --resource-group my-rg \
 #       --vm-name my-vm \
@@ -98,10 +114,9 @@ parse_args() {
         esac
     done
 
-    [[ -n "$RESOURCE_GROUP"   ]] || die "--resource-group is required."
-    [[ -n "$VM_NAME"          ]] || die "--vm-name is required."
-    [[ -n "$IMAGE_NAME"       ]] || die "--image-name is required."
-    [[ -n "$STORAGE_ACCOUNT"  ]] || die "--storage-account is required."
+    [[ -n "$RESOURCE_GROUP"  ]] || die "--resource-group is required."
+    [[ -n "$IMAGE_NAME"      ]] || die "--image-name is required."
+    [[ -n "$STORAGE_ACCOUNT" ]] || die "--storage-account is required."
 }
 
 # ---------------------------------------------------------------------------
@@ -111,6 +126,14 @@ get_vm_location() {
     az vm show \
         --resource-group "$RESOURCE_GROUP" \
         --name "$VM_NAME" \
+        --query location \
+        --output tsv
+}
+
+get_image_location() {
+    az image show \
+        --resource-group "$RESOURCE_GROUP" \
+        --name "$IMAGE_NAME" \
         --query location \
         --output tsv
 }
@@ -131,26 +154,15 @@ get_vm_power_state() {
         --output tsv
 }
 
-ensure_container_exists() {
-    local exists
-    exists=$(az storage container exists \
-        --account-name "$STORAGE_ACCOUNT" \
-        --name "$CONTAINER" \
-        --auth-mode login \
-        --query exists \
-        --output tsv 2>/dev/null || echo "false")
-    if [[ "$exists" != "true" ]]; then
-        log "Creating blob container '$CONTAINER' in '$STORAGE_ACCOUNT'..."
-        az storage container create \
-            --account-name "$STORAGE_ACCOUNT" \
-            --name "$CONTAINER" \
-            --auth-mode login \
-            --output none
-    fi
+image_exists() {
+    az image show \
+        --resource-group "$RESOURCE_GROUP" \
+        --name "$IMAGE_NAME" \
+        --output none 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
-# Main steps
+# VM-mode steps
 # ---------------------------------------------------------------------------
 step_deallocate() {
     local state
@@ -195,6 +207,9 @@ step_capture_image() {
     log "Managed image '$IMAGE_NAME' created."
 }
 
+# ---------------------------------------------------------------------------
+# Shared export steps
+# ---------------------------------------------------------------------------
 step_get_image_disk_id() {
     az image show \
         --resource-group "$RESOURCE_GROUP" \
@@ -205,10 +220,6 @@ step_get_image_disk_id() {
 
 step_generate_sas_url() {
     local disk_id="$1"
-    local expiry
-    expiry=$(date -u -d "+${RETENTION_HOURS} hours" +"%Y-%m-%dT%H:%MZ" 2>/dev/null \
-        || date -u -v "+${RETENTION_HOURS}H" +"%Y-%m-%dT%H:%MZ")  # macOS fallback
-
     log "Generating SAS URL for disk (valid ${RETENTION_HOURS}h)..."
     local sas_url
     sas_url=$(az disk grant-access \
@@ -268,34 +279,43 @@ main() {
         require_cmd azcopy
     fi
 
-    # Verify login
     az account show --output none 2>/dev/null || die "Not logged into Azure CLI. Run 'az login' first."
 
-    # Resolve location if not supplied
-    if [[ -z "$LOCATION" ]]; then
-        LOCATION=$(get_vm_location)
-        log "Using VM location: $LOCATION"
+    if [[ -n "$VM_NAME" ]]; then
+        # ---- VM mode ----
+        log "Mode: capture VM '$VM_NAME' then export."
+
+        if [[ -z "$LOCATION" ]]; then
+            LOCATION=$(get_vm_location)
+            log "Using VM location: $LOCATION"
+        fi
+
+        local os_type
+        os_type=$(get_vm_os_type)
+        log "VM OS type: $os_type"
+
+        step_deallocate
+        step_generalize "$os_type"
+        step_capture_image
+    else
+        # ---- Image mode ----
+        log "Mode: export existing managed image '$IMAGE_NAME'."
+
+        image_exists || die "Managed image '$IMAGE_NAME' not found in resource group '$RESOURCE_GROUP'."
+
+        if [[ -z "$LOCATION" ]]; then
+            LOCATION=$(get_image_location)
+            log "Using image location: $LOCATION"
+        fi
+
+        # --keep-image is implied — we did not create the image, so never delete it
+        KEEP_IMAGE=true
     fi
 
-    local os_type
-    os_type=$(get_vm_os_type)
-    log "VM OS type: $os_type"
-
-    # Step 1 — Deallocate
-    step_deallocate
-
-    # Step 2 — Generalize
-    step_generalize "$os_type"
-
-    # Step 3 — Capture managed image
-    step_capture_image
-
-    # Step 4 — Get the OS disk ID from the managed image
     local disk_id
     disk_id=$(step_get_image_disk_id)
     log "Image OS disk ID: $disk_id"
 
-    # Step 5 — Generate SAS URL for direct disk access
     local sas_url
     sas_url=$(step_generate_sas_url "$disk_id")
 
@@ -304,18 +324,13 @@ main() {
         log "SAS URL (expires in ${RETENTION_HOURS}h):"
         echo "$sas_url"
     else
-        # Step 6 — Download VHD locally
         local dest_file="${OUTPUT_DIR}/${IMAGE_NAME}.vhd"
         step_download_vhd "$sas_url" "$dest_file"
-
-        # Step 7 — Revoke SAS
         step_revoke_sas "$disk_id"
-
         log "Export complete. VHD saved to: $dest_file"
         log "Transfer this file to your air-gapped environment."
     fi
 
-    # Step 8 — Optionally delete the managed image
     step_cleanup_image
 
     log "Done."
