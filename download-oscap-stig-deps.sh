@@ -48,6 +48,7 @@ RPM_PACKAGES=(
     fapolicyd
     mailx
     opensc
+    postfix
     policycoreutils-python-utils
     python3-libselinux
     python3-policycoreutils
