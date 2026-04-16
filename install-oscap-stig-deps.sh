@@ -32,6 +32,7 @@ DEPS_DIR="${DEPS_DIR:-$(dirname "$(realpath "$0")")}"
 # Packages the playbook installs — used for targeted verification after install
 PLAYBOOK_PACKAGES=(
     aide
+    opensc
     policycoreutils-python-utils
     python3-libselinux
     python3-policycoreutils
