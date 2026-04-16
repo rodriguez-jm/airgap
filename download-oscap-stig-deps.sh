@@ -45,6 +45,7 @@ ARCH="${ARCH:-x86_64}"
 # bundle is self-contained on a fresh air-gapped VM.
 RPM_PACKAGES=(
     aide
+    fapolicyd
     opensc
     policycoreutils-python-utils
     python3-libselinux
