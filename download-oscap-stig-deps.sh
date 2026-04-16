@@ -49,6 +49,7 @@ RPM_PACKAGES=(
     mailx
     opensc
     postfix
+    usbguard
     policycoreutils-python-utils
     python3-libselinux
     python3-policycoreutils
